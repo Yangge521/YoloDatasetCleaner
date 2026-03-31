@@ -13,26 +13,34 @@
 ## 核心功能
 1.  **自动统计分析**：生成训练数据中的目标尺寸（px）和面积（px²）分布。
 2.  **可视化报表**：自动绘制高对比度的分布散点图和直方图。
-3.  **批量数据集处理**：支持递归扫描多个目录，并通过 YAML 配置文件统一管理阈值。
-4.  **安全清洗模式**：支持按像素阈值过滤标签，自动备份原始文件（.bak）。
-5.  **详尽审计记录**：CSV 格式记录每个被删除目标的具体位置和参数。
+3.  **多进程加速 (New)**：支持并行处理，大幅提升大规模数据集的处理速度。
+4.  **精确分析模式 (New)**：可选自动读取原图分辨率，消除单一分辨率假设带来的偏差。
+5.  **垃圾回收与同步清理 (New)**：支持将无效标签及对应的“空标注”图片同步移至垃圾桶目录。
+6.  **安全清洗模式**：支持按像素阈值过滤标签，自动备份原始文件（.bak）。
 
 ## 快速使用
 
 ### 1. 安装依赖
 ```bash
-pip install matplotlib pyyaml
+pip install matplotlib pyyaml tqdm Pillow
 ```
 
 ### 2. 统计与分析 (暂不删除)
 ```bash
-python Yolo_clear.py --config config_example.yaml
+python Yolo_clear.py --config config_example.yaml --precise
 ```
 
-### 3. 执行清洗 (正式删除)
+### 3. 执行清洗 (开启加速与自动清理)
 ```bash
-python Yolo_clear.py -d --config config_example.yaml
+python Yolo_clear.py -d --config config_example.yaml --precise --clean-img --workers 8
 ```
+
+## 核心参数说明
+- `-d`: 启用删除模式（会修改文件）。
+- `--precise`: 启用精确图像尺寸探测。
+- `--clean-img`: 当标签清空时，同步移动对应的图片文件。
+- `--garbage <dir>`: 指定统一的失效数据存放目录。
+- `--workers <N>`: 指定进程池数量（默认 4）。
 
 ## 目录说明
 - `Yolo_clear.py`: 主执行脚本。

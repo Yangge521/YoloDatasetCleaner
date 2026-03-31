@@ -25,14 +25,35 @@ min_single_side: 8
 max_aspect_ratio: 6.0
 
 
+# --- 增强处理选项 ---
+
+# 1. 开启多进程加速 (Multiprocessing)
+# 指定最大工作核心数。建议设为 CPU 核心数。
+max_workers: 8
+
+# 2. 开启精确图像检测 (Precise mode)
+# 启用后，脚本将自动读取原图头信息获取真实 Width/Height，计算真正的物体像素级面积。
+# 如果图片不存在，会自动降级为 yolo_train_res 进行计算。
+use_precise_resolution: false
+
+# 3. 同步清理垃圾图像 (Garbage Collection)
+# 开启后，如果一个标签文件因为清洗而变成空标签 (即无目标)，脚本会将标签及其对应的图片同步移走。
+remove_empty_image: false
+
+# 4. 指定垃圾收纳箱/备份目录 (Garbage Dir)
+# 若留空，则会在数据集目录下默认生成 "garbage" 文件夹。
+# 若指定，所有的备份文件 (.txt.bak) 和被移除的失效数据都会被统一移动到此目录。
+# garbage_dir: "D:/my_project/dataset_garbage"
+
+
 # --- 扫描选项 ---
 
-# 需要扫描的标签子目录列表（相对于数据集根目录）
+# 需要扫描的标签子目录列表 (相对于数据集根目录)
 label_dirs:
   - "train/labels"
   - "Val/labels"
 
-# （可选）批量处理多个数据集的根目录
+# (可选) 批量处理多个数据集的根目录
 # datasets:
 #   - "D:/my_datasets/dataset_v1"
 #   - "D:/my_datasets/dataset_v2"

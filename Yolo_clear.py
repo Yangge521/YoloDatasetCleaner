@@ -30,6 +30,19 @@ from pathlib import Path
 # 修复 Windows 终端 GBK 编码问题
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 # ======================== 可选依赖（优雅降级） ========================
 try:
     import matplotlib
@@ -56,6 +69,9 @@ DEFAULT_CONFIG = {
         "train/labels",
         "Val/labels",
     ],
+    "use_precise_resolution": False,
+    "remove_empty_image": False,    # 是否在标签清空后同步移动图片到垃圾桶
+    "max_workers": 4,
 }
 
 
@@ -122,132 +138,216 @@ def load_config(config_path: str | None) -> dict:
 
 
 # ======================== 核心分析函数 ========================
+# ======================== 核心分析逻辑 (单文件处理) ========================
+def process_single_label(
+    txt_file: Path,
+    delete_mode: bool,
+    train_res: int,
+    config: dict,
+    image_dir: Path | None = None,
+) -> dict[str, any]:
+    """
+    具体的单标注文件处理逻辑。
+    为多进程并行化设计的独立函数。
+    """
+    min_area = config.get("min_area_threshold", 128)
+    min_side = config.get("min_single_side", 8)
+    max_ratio = config.get("max_aspect_ratio", 6.0)
+    use_precise = config.get("use_precise_resolution", False)
+    
+    # 尝试自动检测图像分辨率
+    current_w_res = train_res
+    current_h_res = train_res
+    
+    if use_precise and image_dir and image_dir.exists() and HAS_PIL:
+        # 支持常见图片后缀
+        for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+            img_path = image_dir / (txt_file.stem + ext)
+            if img_path.exists():
+                try:
+                    with Image.open(img_path) as img:
+                        current_w_res, current_h_res = img.size
+                    break
+                except:
+                    pass
+    
+    # 初始化统计数据
+    file_total = 0
+    file_small = 0
+    file_changed = False
+    targets = []
+    deleted = []
+    
+    # 垃圾回收配置
+    garbage_dir = config.get("garbage_dir", None)
+    
+    with open(txt_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    keep_lines = []
+    for line_idx, line in enumerate(lines, start=1):
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+
+        try:
+            class_id = int(parts[0])
+            cx, cy, w, h = map(float, parts[1:5])
+        except ValueError:
+            keep_lines.append(line)
+            continue
+
+        pixel_w = w * current_w_res
+        pixel_h = h * current_h_res
+        # 如果是精确模式，为了对标 640x640 的阈值，需要缩放面积
+        # 或者直接按比例换算。这里统一换算到 train_res 下的有效像素更为通用
+        if use_precise:
+            scale_factor = train_res / max(current_w_res, current_h_res)
+            pixel_w *= scale_factor
+            pixel_h *= scale_factor
+
+        area = pixel_w * pixel_h
+        short_side = min(pixel_w, pixel_h)
+        long_side = max(pixel_w, pixel_h)
+        aspect_ratio = long_side / max(short_side, 1e-6)
+
+        reasons = []
+        if area < min_area:
+            reasons.append(f"面积不足({area:.0f}<{min_area})")
+        if short_side < min_side:
+            reasons.append(f"单边太细({short_side:.1f}<{min_side})")
+        if aspect_ratio > max_ratio:
+            reasons.append(f"比例畸形({aspect_ratio:.1f}>{max_ratio})")
+
+        is_unsafe = len(reasons) > 0
+        reason_str = "|".join(reasons) if is_unsafe else "安全"
+        file_total += 1
+
+        target_info = {
+            "file": txt_file.name,
+            "line": line_idx,
+            "class_id": class_id,
+            "cx": cx, "cy": cy, "norm_w": w, "norm_h": h,
+            "pixel_w": round(pixel_w, 2), "pixel_h": round(pixel_h, 2),
+            "area": round(area, 2), "aspect_ratio": round(aspect_ratio, 2),
+            "is_small": is_unsafe, "reason": reason_str,
+        }
+        targets.append(target_info)
+
+        if is_unsafe:
+            file_small += 1
+            file_changed = True
+            deleted.append(target_info)
+            if not delete_mode:
+                keep_lines.append(line)
+        else:
+            keep_lines.append(line)
+
+    if delete_mode and file_changed:
+        # 如果设置了统一垃圾桶目录，则移动备份
+        if garbage_dir:
+            garbage_dir = Path(garbage_dir)
+            garbage_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(txt_file, garbage_dir / (txt_file.name + ".bak"))
+        else:
+            backup_file = txt_file.with_suffix('.txt.bak')
+            if not backup_file.exists():
+                shutil.copy2(txt_file, backup_file)
+        
+        # 写入新内容
+        with open(txt_file, "w", encoding="utf-8") as f:
+            f.writelines(keep_lines)
+            
+        # 如果开启了空图清理逻辑
+        if config.get("remove_empty_image") and len(keep_lines) == 0:
+            if image_dir and image_dir.exists():
+                for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+                    img_path = image_dir / (txt_file.stem + ext)
+                    if img_path.exists():
+                        if garbage_dir:
+                            shutil.move(str(img_path), str(garbage_dir / img_path.name))
+                        else:
+                            # 默认移动到 labels 同级的 garbage 目录
+                            g_dir = label_dir.parent / "garbage"
+                            g_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(img_path), str(g_dir / img_path.name))
+                        break
+            # 同时将空标签也移走
+            if garbage_dir:
+                shutil.move(str(txt_file), str(garbage_dir / txt_file.name))
+            else:
+                g_dir = label_dir.parent / "garbage"
+                g_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(txt_file), str(g_dir / txt_file.name))
+
+    return {
+        "file_total": file_total,
+        "file_small": file_small,
+        "file_changed": file_changed,
+        "targets": targets,
+        "deleted": deleted,
+    }
+
+
 def analyze_labels(
     label_dir: Path,
     delete_mode: bool,
     train_res: int,
     config: dict,
     logger: logging.Logger,
-) -> dict:
+) -> dict[str, any]:
     """
-    分析单个标签目录，根据多维度安全线筛选无效目标。
-    依据：
-      1. Area (面积) >= 128px^2
-      2. MinSide (短边) >= 8px
-      3. AspectRatio (比例) <= 6:1
-
-    返回字典包含：
-      - scanned_files: 扫描的文件数
-      - total: 总目标数
-      - small: 小目标数
-      - modified_files: 修改的文件数
-      - targets: 所有目标的详细信息列表
-      - deleted: 被删除/标记的目标详细信息列表
+    分析单个标签目录（并行化重构版）。
+    支持进度条显示和多进程分发。
     """
-    min_area = config.get("min_area_threshold", 128)
-    min_side = config.get("min_single_side", 8)
-    max_ratio = config.get("max_aspect_ratio", 6.0)
+    txt_files = sorted(label_dir.glob("*.txt"))
+    # 过滤 classes.txt
+    txt_files = [f for f in txt_files if f.name != "classes.txt"]
+    
+    scanned_files = len(txt_files)
     total = 0
     small = 0
     modified_files = 0
-    scanned_files = 0
+    all_targets = []
+    deleted_targets = []
 
-    all_targets = []     # 所有目标详细信息
-    deleted_targets = [] # 被删除/标记的小目标信息
+    # 使用多进程池提升处理效率
+    # 注意：Windows 下子进程中没有主线程的 logger，需统一在主线程打印日志
+    max_workers = config.get("max_workers", 4)
+    
+    desc = f"扫描 {label_dir.parent.name}/{label_dir.name}"
+    disable_pbar = not HAS_TQDM
+    
+    # 寻找对应的图像目录 (通常在 labels 同级的 images 目录)
+    image_dir = None
+    if label_dir.name == 'labels':
+        possible_img_dir = label_dir.parent / 'images'
+        if possible_img_dir.exists():
+            image_dir = possible_img_dir
 
-    for txt_file in sorted(label_dir.glob("*.txt")):
-        # 跳过 classes.txt
-        if txt_file.name == "classes.txt":
-            continue
-
-        scanned_files += 1
-        logger.debug(f"扫描文件: {txt_file.name}")
-
-        with open(txt_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        keep_lines = []
-        file_changed = False
-
-        for line_idx, line in enumerate(lines, start=1):
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-
-            try:
-                class_id = int(parts[0])
-                cx = float(parts[1])
-                cy = float(parts[2])
-                w = float(parts[3])
-                h = float(parts[4])
-            except ValueError:
-                keep_lines.append(line)
-                continue
-
-            # 归一化宽高 × 训练分辨率 = 实际像素大小
-            pixel_w = w * train_res
-            pixel_h = h * train_res
-
-            # 依据专业安全基准进行判定
-            area = pixel_w * pixel_h
-            short_side = min(pixel_w, pixel_h)
-            long_side = max(pixel_w, pixel_h)
-            aspect_ratio = long_side / max(short_side, 1e-6)
-
-            # 判定原因汇总
-            reasons = []
-            if area < min_area:
-                reasons.append(f"面积不足({area:.0f}<{min_area})")
-            if short_side < min_side:
-                reasons.append(f"单边太细({short_side:.1f}<{min_side})")
-            if aspect_ratio > max_ratio:
-                reasons.append(f"比例畸形({aspect_ratio:.1f}>{max_ratio})")
-
-            is_unsafe = len(reasons) > 0
-            reason_str = "|".join(reasons) if is_unsafe else "安全"
-
-            total += 1
-
-            # 记录每个目标的详细信息
-            target_info = {
-                "file": txt_file.name,
-                "line": line_idx,
-                "class_id": class_id,
-                "cx": cx,
-                "cy": cy,
-                "norm_w": w,
-                "norm_h": h,
-                "pixel_w": round(pixel_w, 2),
-                "pixel_h": round(pixel_h, 2),
-                "area": round(area, 2),
-                "aspect_ratio": round(aspect_ratio, 2),
-                "is_small": is_unsafe,
-                "reason": reason_str,
-            }
-            all_targets.append(target_info)
-
-            if is_unsafe:
-                small += 1
-                file_changed = True
-                deleted_targets.append(target_info)
-                logger.warning(
-                    f"亚健康目标 → {txt_file.name}:L{line_idx}  "
-                    f"类别={class_id}  原因={reason_str}"
-                )
-                # 仅统计模式下仍保留该行（不写回）
-                if not delete_mode:
-                    keep_lines.append(line)
-            else:
-                keep_lines.append(line)
-
-        # 删除模式下，有变动才写回
-        if delete_mode and file_changed:
-            # 在删除前自动备份原始文件
-            shutil.copy2(txt_file, txt_file.with_suffix('.txt.bak'))
-            with open(txt_file, "w", encoding="utf-8") as f:
-                f.writelines(keep_lines)
-            modified_files += 1
-            logger.info(f"  [已修改] {txt_file.name} (备份 → {txt_file.name}.bak)")
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_single_label, f, delete_mode, train_res, config, image_dir): f for f in txt_files}
+        
+        # 包装 tqdm 进度条
+        pbar = tqdm(total=scanned_files, desc=desc, disable=disable_pbar, unit="file", leave=False)
+        
+        for future in as_completed(futures):
+            res = future.result()
+            total += res["file_total"]
+            small += res["file_small"]
+            if res["file_changed"]:
+                modified_files += 1
+            
+            all_targets.extend(res["targets"])
+            deleted_targets.extend(res["deleted"])
+            
+            # 主线程汇总警告日志
+            for d in res["deleted"]:
+                logger.warning(f"亚健康目标 → {d['file']}:L{d['line']} 类别={d['class_id']} 原因={d['reason']}")
+            
+            pbar.update(1)
+        
+        pbar.close()
 
     return {
         "scanned_files": scanned_files,
@@ -534,12 +634,35 @@ def main():
     )
     parser.add_argument(
         "--no-plot", action="store_true",
-        help="跳过生成可视化图表",
+        help="跳过图形",
+    )
+    parser.add_argument(
+        "--garbage", type=str, default=None,
+        help="指定垃圾回收/备份目录 (默认: 在数据集下生成 garbage 文件夹)",
+    )
+    parser.add_argument(
+        "--precise", action="store_true",
+        help="开启精确模式：读取图片文件获取真实分辨率",
+    )
+    parser.add_argument(
+        "--clean-img", action="store_true",
+        help="开启同步清理：如果标签清空，则移动对应图片",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="指定多进程工作线程数 (默认: 4)",
     )
     args = parser.parse_args()
 
     # ---------- 加载配置 ----------
     config = load_config(args.config)
+    
+    # 命令行参数覆盖配置
+    if args.precise: config["use_precise_resolution"] = True
+    if args.clean_img: config["remove_empty_image"] = True
+    if args.garbage: config["garbage_dir"] = args.garbage
+    if args.workers: config["max_workers"] = args.workers
+    
     delete_mode = args.d
     train_res = config["yolo_train_res"]
     label_dirs = config["label_dirs"]
