@@ -1,0 +1,25 @@
+# ================================================
+# YOLO 数据集小目标清洗工具 - 配置文件示例
+# ================================================
+# 用法: python Yolo_clear.py --config config_example.yaml
+#
+# 说明: 此文件中的参数会覆盖代码内的默认值。
+#       未指定的参数将保持默认值不变。
+
+# YOLO 训练分辨率（模型输入尺寸，正方形）
+yolo_train_res: 640
+
+# 最小目标像素阈值（宽或高小于该值视为无效小目标）
+min_pixel_threshold: 1
+
+# 需要扫描的标签子目录列表（相对于数据集根目录）
+label_dirs:
+  - "train/labels"
+  - "Val/labels"
+
+# （可选）批量处理多个数据集的根目录
+# 取消注释并修改为你的实际路径即可启用
+# datasets:
+#   - "D:/my_datasets/dataset_v1"
+#   - "D:/my_datasets/dataset_v2"
+#   - "D:/my_datasets/dataset_v3"
