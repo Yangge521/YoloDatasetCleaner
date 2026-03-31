@@ -49,7 +49,9 @@ except ImportError:
 # ======================== 内部默认配置 ========================
 DEFAULT_CONFIG = {
     "yolo_train_res": 640,
-    "min_pixel_threshold": 32,
+    "min_area_threshold": 128,      # 安全面积：训练分辨率下至少有 128 像素 (对标 640x640 下的长宽)
+    "min_single_side": 8,           # 安全单边：宽或高中最细的一边至少 8 像素
+    "max_aspect_ratio": 6.0,       # 安全长宽比：长边与短边比例不应超过 6:1 (例如 5x50 = 10倍)
     "label_dirs": [
         "train/labels",
         "Val/labels",
@@ -116,10 +118,6 @@ def load_config(config_path: str | None) -> dict:
         if key in user_config:
             config[key] = user_config[key]
 
-    # datasets 是额外字段，不在默认配置中
-    if "datasets" in user_config:
-        config["datasets"] = user_config["datasets"]
-
     return config
 
 
@@ -128,11 +126,15 @@ def analyze_labels(
     label_dir: Path,
     delete_mode: bool,
     train_res: int,
-    min_threshold: int,
+    config: dict,
     logger: logging.Logger,
 ) -> dict:
     """
-    分析单个标签目录，返回详细统计结果。
+    分析单个标签目录，根据多维度安全线筛选无效目标。
+    依据：
+      1. Area (面积) >= 128px^2
+      2. MinSide (短边) >= 8px
+      3. AspectRatio (比例) <= 6:1
 
     返回字典包含：
       - scanned_files: 扫描的文件数
@@ -142,6 +144,9 @@ def analyze_labels(
       - targets: 所有目标的详细信息列表
       - deleted: 被删除/标记的目标详细信息列表
     """
+    min_area = config.get("min_area_threshold", 128)
+    min_side = config.get("min_single_side", 8)
+    max_ratio = config.get("max_aspect_ratio", 6.0)
     total = 0
     small = 0
     modified_files = 0
@@ -183,8 +188,25 @@ def analyze_labels(
             pixel_w = w * train_res
             pixel_h = h * train_res
 
+            # 依据专业安全基准进行判定
+            area = pixel_w * pixel_h
+            short_side = min(pixel_w, pixel_h)
+            long_side = max(pixel_w, pixel_h)
+            aspect_ratio = long_side / max(short_side, 1e-6)
+
+            # 判定原因汇总
+            reasons = []
+            if area < min_area:
+                reasons.append(f"面积不足({area:.0f}<{min_area})")
+            if short_side < min_side:
+                reasons.append(f"单边太细({short_side:.1f}<{min_side})")
+            if aspect_ratio > max_ratio:
+                reasons.append(f"比例畸形({aspect_ratio:.1f}>{max_ratio})")
+
+            is_unsafe = len(reasons) > 0
+            reason_str = "|".join(reasons) if is_unsafe else "安全"
+
             total += 1
-            is_small = pixel_w < min_threshold or pixel_h < min_threshold
 
             # 记录每个目标的详细信息
             target_info = {
@@ -197,17 +219,20 @@ def analyze_labels(
                 "norm_h": h,
                 "pixel_w": round(pixel_w, 2),
                 "pixel_h": round(pixel_h, 2),
-                "is_small": is_small,
+                "area": round(area, 2),
+                "aspect_ratio": round(aspect_ratio, 2),
+                "is_small": is_unsafe,
+                "reason": reason_str,
             }
             all_targets.append(target_info)
 
-            if is_small:
+            if is_unsafe:
                 small += 1
                 file_changed = True
                 deleted_targets.append(target_info)
                 logger.warning(
-                    f"小目标 → {txt_file.name}:L{line_idx}  "
-                    f"类别={class_id}  像素={pixel_w:.1f}×{pixel_h:.1f}"
+                    f"亚健康目标 → {txt_file.name}:L{line_idx}  "
+                    f"类别={class_id}  原因={reason_str}"
                 )
                 # 仅统计模式下仍保留该行（不写回）
                 if not delete_mode:
@@ -314,16 +339,18 @@ def generate_distribution_plot(
             zorder=3,
         )
 
-    # 阈值区域：用半透明红色矩形标记"危险区"
+    # 阈值区域：用半透明红色矩形标记小面积区（作为示意）
+    # 这里的 min_threshold 取单边最小值用于绘图参考
+    min_side = min_threshold
     danger_rect = Rectangle(
-        (0, 0), min_threshold, min_threshold,
+        (0, 0), min_side, min_side,
         linewidth=0, facecolor="#ff1744", alpha=0.08, zorder=1,
     )
     ax1.add_patch(danger_rect)
 
     # 阈值线
-    ax1.axvline(x=min_threshold, color="#ff6e40", linewidth=1.5, linestyle="--", alpha=0.8, label=f"阈值 ({min_threshold}px)")
-    ax1.axhline(y=min_threshold, color="#ff6e40", linewidth=1.5, linestyle="--", alpha=0.8)
+    ax1.axvline(x=min_side, color="#ff6e40", linewidth=1.5, linestyle="--", alpha=0.8, label=f"单边线 ({min_side}px)")
+    ax1.axhline(y=min_side, color="#ff6e40", linewidth=1.5, linestyle="--", alpha=0.8)
 
     ax1.set_xlabel("像素宽度 (px)", fontsize=12)
     ax1.set_ylabel("像素高度 (px)", fontsize=12)
@@ -407,7 +434,7 @@ def generate_text_report(
     lines.append(f"  数据集根目录: {dataset_root}")
     lines.append(f"  执行模式    : {mode_text}")
     lines.append(f"  训练分辨率  : {config['yolo_train_res']}×{config['yolo_train_res']}")
-    lines.append(f"  像素阈值    : {config['min_pixel_threshold']}×{config['min_pixel_threshold']}")
+    lines.append(f"  安全阈值    : 面积>{config['min_area_threshold']} | 短边>{config['min_single_side']} | 比例<{config['max_aspect_ratio']}:1")
     lines.append("=" * 60)
 
     grand_scanned = 0
@@ -462,7 +489,7 @@ def generate_csv_report(all_deleted: list[dict], output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_file = output_dir / "deleted_targets.csv"
 
-    headers = ["文件名", "行号", "类别ID", "归一化宽", "归一化高", "像素宽", "像素高", "操作"]
+    headers = ["文件名", "行号", "类别ID", "像素宽", "像素高", "面积", "长宽比", "清洗原因", "状态"]
 
     with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -472,11 +499,12 @@ def generate_csv_report(all_deleted: list[dict], output_dir: Path):
                 t["file"],
                 t["line"],
                 t["class_id"],
-                f"{t['norm_w']:.6f}",
-                f"{t['norm_h']:.6f}",
                 t["pixel_w"],
                 t["pixel_h"],
-                "已删除" if t.get("deleted", True) else "已标记",
+                t["area"],
+                t["aspect_ratio"],
+                t["reason"],
+                "已删除" if t.get("deleted", True) else "仅标记",
             ])
 
     print(f"  [报告] 清洗明细已保存: {csv_file}  ({len(all_deleted)} 条记录)")
@@ -514,7 +542,6 @@ def main():
     config = load_config(args.config)
     delete_mode = args.d
     train_res = config["yolo_train_res"]
-    min_threshold = config["min_pixel_threshold"]
     label_dirs = config["label_dirs"]
 
     # 确定数据集根目录列表
@@ -534,7 +561,7 @@ def main():
     mode_text = "分析 + 清洗（将修改文件）" if delete_mode else "仅统计分析（不修改文件）"
     logger.info(f"执行模式  : {mode_text}")
     logger.info(f"训练分辨率: {train_res}×{train_res}")
-    logger.info(f"像素阈值  : {min_threshold}×{min_threshold}")
+    logger.info(f"安全红线  : 面积>{config['min_area_threshold']} | 短边>{config['min_single_side']} | 比例<{config['max_aspect_ratio']}")
     logger.info(f"数据集数量: {len(dataset_roots)}")
     logger.info("=" * 50)
 
@@ -564,7 +591,7 @@ def main():
                 continue
 
             logger.info(f"\n  正在扫描: {sub} ...")
-            result = analyze_labels(label_path, delete_mode, train_res, min_threshold, logger)
+            result = analyze_labels(label_path, delete_mode, train_res, config, logger)
 
             ratio = (result["small"] / result["total"] * 100) if result["total"] > 0 else 0.0
 
@@ -582,7 +609,7 @@ def main():
         # 为每个数据集生成可视化（如果未禁用）
         if not args.no_plot and ds_targets:
             generate_distribution_plot(
-                ds_targets, min_threshold, train_res, output_dir,
+                ds_targets, config["min_single_side"], train_res, output_dir,
                 dataset_name=Path(ds_name).name,
             )
 
@@ -615,7 +642,7 @@ def main():
     # 如果处理了多个数据集，额外生成一张总体分布图
     if not args.no_plot and len(dataset_roots) > 1 and global_all_targets:
         generate_distribution_plot(
-            global_all_targets, min_threshold, train_res, output_dir,
+            global_all_targets, config["min_single_side"], train_res, output_dir,
             dataset_name="汇总",
         )
 

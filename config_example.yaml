@@ -4,13 +4,28 @@
 # 用法: python Yolo_clear.py --config config_example.yaml
 #
 # 说明: 此文件中的参数会覆盖代码内的默认值。
-#       未指定的参数将保持默认值不变。
+#       基于 YOLO 训练实践，不满足以下三条“安全线”的目标会被自动清洗。
 
-# YOLO 训练分辨率（模型输入尺寸，正方形）
+# [核心参数] YOLO 训练分辨率 (模型输入的尺度)
 yolo_train_res: 640
 
-# 最小目标像素阈值（宽或高小于该值视为无效小目标）
-min_pixel_threshold: 1
+# --- 安全线设定 (不满足以下任一条件将触发清洗) ---
+
+# 1. 最小面积阈值 (Total Pixels)
+# 在 640x640 下，通常建议总像素 >= 128 (约 11x11 像素)
+min_area_threshold: 128
+
+# 2. 单边最低像素 (Single Side)
+# 宽或高中最细的一边不应小于此值。建议 >= 8 像素
+min_single_side: 8
+
+# 3. 最大长宽比 (Max Aspect Ratio)
+# 长边 / 短边 的比例。过细的长条（如 5x50 = 10倍）难以收敛。
+# 建议不超过 6.0 (即 6:1)
+max_aspect_ratio: 6.0
+
+
+# --- 扫描选项 ---
 
 # 需要扫描的标签子目录列表（相对于数据集根目录）
 label_dirs:
@@ -18,8 +33,6 @@ label_dirs:
   - "Val/labels"
 
 # （可选）批量处理多个数据集的根目录
-# 取消注释并修改为你的实际路径即可启用
 # datasets:
 #   - "D:/my_datasets/dataset_v1"
 #   - "D:/my_datasets/dataset_v2"
-#   - "D:/my_datasets/dataset_v3"
