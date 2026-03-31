@@ -22,8 +22,10 @@ import argparse
 import csv
 import io
 import logging
+import random
 import shutil
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -72,6 +74,8 @@ DEFAULT_CONFIG = {
     "use_precise_resolution": False,
     "remove_empty_image": False,    # 是否在标签清空后同步移动图片到垃圾桶
     "max_workers": 4,
+    "audit_n": 20,                  # 抽样生成的审核预览图数量
+    "class_thresholds": {},         # 类别特定阈值，例如 {0: {"min_area": 100}}
 }
 
 
@@ -137,7 +141,25 @@ def load_config(config_path: str | None) -> dict:
     return config
 
 
-# ======================== 核心分析函数 ========================
+def load_classes(label_dir: Path) -> dict[int, str]:
+    """
+    尝试从标签目录附近的 classes.txt 或上级目录加载类别名称。
+    """
+    search_paths = [
+        label_dir / "classes.txt",
+        label_dir.parent / "classes.txt",
+        label_dir.parent.parent / "classes.txt"
+    ]
+    for p in search_paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return {i: line.strip() for i, line in enumerate(f) if line.strip()}
+            except:
+                continue
+    return {}
+
+
 # ======================== 核心分析逻辑 (单文件处理) ========================
 def process_single_label(
     txt_file: Path,
@@ -154,6 +176,7 @@ def process_single_label(
     min_side = config.get("min_single_side", 8)
     max_ratio = config.get("max_aspect_ratio", 6.0)
     use_precise = config.get("use_precise_resolution", False)
+    class_thresholds = config.get("class_thresholds", {})
     
     # 尝试自动检测图像分辨率
     current_w_res = train_res
@@ -184,6 +207,15 @@ def process_single_label(
     with open(txt_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
+    # 预先确定对应的图片路径（用于后续审计）
+    found_img_p = None
+    if image_dir and image_dir.exists():
+        for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+            test_p = image_dir / (txt_file.stem + ext)
+            if test_p.exists():
+                found_img_p = str(test_p)
+                break
+
     keep_lines = []
     for line_idx, line in enumerate(lines, start=1):
         parts = line.strip().split()
@@ -199,10 +231,25 @@ def process_single_label(
 
         pixel_w = w * current_w_res
         pixel_h = h * current_h_res
-        # 如果是精确模式，为了对标 640x640 的阈值，需要缩放面积
-        # 或者直接按比例换算。这里统一换算到 train_res 下的有效像素更为通用
+        
+        # 类别特定阈值匹配
+        c_min_area = min_area
+        c_min_side = min_side
+        c_max_ratio = max_ratio
+        if str(class_id) in class_thresholds:
+            ct = class_thresholds[str(class_id)]
+            c_min_area = ct.get("min_area", min_area)
+            c_min_side = ct.get("min_side", min_side)
+            c_max_ratio = ct.get("max_ratio", max_ratio)
+        elif class_id in class_thresholds:
+            ct = class_thresholds[class_id]
+            c_min_area = ct.get("min_area", min_area)
+            c_min_side = ct.get("min_side", min_side)
+            c_max_ratio = ct.get("max_ratio", max_ratio)
+
+        # 缩放至训练分辨率对标尺度
         if use_precise:
-            scale_factor = train_res / max(current_w_res, current_h_res)
+            scale_factor = train_res / max(current_w_res, current_h_res, 1e-6)
             pixel_w *= scale_factor
             pixel_h *= scale_factor
 
@@ -212,12 +259,12 @@ def process_single_label(
         aspect_ratio = long_side / max(short_side, 1e-6)
 
         reasons = []
-        if area < min_area:
-            reasons.append(f"面积不足({area:.0f}<{min_area})")
-        if short_side < min_side:
-            reasons.append(f"单边太细({short_side:.1f}<{min_side})")
-        if aspect_ratio > max_ratio:
-            reasons.append(f"比例畸形({aspect_ratio:.1f}>{max_ratio})")
+        if area < c_min_area:
+            reasons.append(f"面积不足({area:.0f}<{c_min_area})")
+        if short_side < c_min_side:
+            reasons.append(f"单边太细({short_side:.1f}<{c_min_side})")
+        if aspect_ratio > c_max_ratio:
+            reasons.append(f"比例畸形({aspect_ratio:.1f}>{c_max_ratio})")
 
         is_unsafe = len(reasons) > 0
         reason_str = "|".join(reasons) if is_unsafe else "安全"
@@ -231,6 +278,7 @@ def process_single_label(
             "pixel_w": round(pixel_w, 2), "pixel_h": round(pixel_h, 2),
             "area": round(area, 2), "aspect_ratio": round(aspect_ratio, 2),
             "is_small": is_unsafe, "reason": reason_str,
+            "img_path": found_img_p,                      # 注入图片路径
         }
         targets.append(target_info)
 
@@ -310,15 +358,18 @@ def analyze_labels(
     modified_files = 0
     all_targets = []
     deleted_targets = []
+    
+    # 类别统计容器
+    class_stats = Counter()    # 各类别总数
+    class_damaged = Counter() # 各类别亚健康数
 
     # 使用多进程池提升处理效率
-    # 注意：Windows 下子进程中没有主线程的 logger，需统一在主线程打印日志
     max_workers = config.get("max_workers", 4)
     
     desc = f"扫描 {label_dir.parent.name}/{label_dir.name}"
     disable_pbar = not HAS_TQDM
     
-    # 寻找对应的图像目录 (通常在 labels 同级的 images 目录)
+    # 寻找对应的图像目录
     image_dir = None
     if label_dir.name == 'labels':
         possible_img_dir = label_dir.parent / 'images'
@@ -328,7 +379,6 @@ def analyze_labels(
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_single_label, f, delete_mode, train_res, config, image_dir): f for f in txt_files}
         
-        # 包装 tqdm 进度条
         pbar = tqdm(total=scanned_files, desc=desc, disable=disable_pbar, unit="file", leave=False)
         
         for future in as_completed(futures):
@@ -341,6 +391,12 @@ def analyze_labels(
             all_targets.extend(res["targets"])
             deleted_targets.extend(res["deleted"])
             
+            # 累加类别统计
+            for t in res["targets"]:
+                class_stats[t["class_id"]] += 1
+                if t["is_small"]:
+                    class_damaged[t["class_id"]] += 1
+
             # 主线程汇总警告日志
             for d in res["deleted"]:
                 logger.warning(f"亚健康目标 → {d['file']}:L{d['line']} 类别={d['class_id']} 原因={d['reason']}")
@@ -356,6 +412,8 @@ def analyze_labels(
         "modified_files": modified_files,
         "targets": all_targets,
         "deleted": deleted_targets,
+        "class_stats": dict(class_stats),
+        "class_damaged": dict(class_damaged),
     }
 
 
@@ -509,6 +567,65 @@ def generate_distribution_plot(
     print(f"  [图表] 分布图已保存: {output_file}")
 
 
+def visualize_audit_samples(deleted_list: list, output_dir: Path, n: int = 20):
+    """
+    抽样生成审核预览图，在原图上标注被删除的目标。
+    """
+    if not HAS_PIL:
+        logger.warning("未安装 PIL (Pillow)，跳过审计图生成。")
+        return
+    
+    if not deleted_list:
+        return
+
+    audit_dir = output_dir / "audit_samples"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 按文件分组，避免重复读取同一张图
+    files_map = {}
+    for item in deleted_list:
+        img_path = item.get("img_path")
+        if img_path and Path(img_path).exists():
+            if img_path not in files_map:
+                files_map[img_path] = []
+            files_map[img_path].append(item)
+    
+    if not files_map:
+        return
+
+    # 随机抽样图片
+    sample_img_paths = random.sample(list(files_map.keys()), min(n, len(files_map)))
+    
+    print(f"  [审计] 正在生成 {len(sample_img_paths)} 张审美审计预览图...")
+    for img_p in sample_img_paths:
+        items = files_map[img_p]
+        try:
+            with Image.open(img_p) as img:
+                img = img.convert("RGB")
+                draw = ImageDraw.Draw(img)
+                w, h = img.size
+                
+                for item in items:
+                    # YOLO 归一化位移转像素 (使用正确的键名 cx, cy, norm_w, norm_h)
+                    cx, cy = item["cx"], item["cy"]
+                    bw, bh = item["norm_w"], item["norm_h"]
+                    x1 = (cx - bw/2) * w
+                    y1 = (cy - bh/2) * h
+                    x2 = (cx + bw/2) * w
+                    y2 = (cy + bh/2) * h
+                    
+                    # 画红框
+                    draw.rectangle([x1, y1, x2, y2], outline="#ff1744", width=3)
+                    # 标注原因
+                    label = f"ID:{item['class_id']} {item['reason']}"
+                    draw.text((x1 + 2, max(0, y1 - 18)), label, fill="#ff1744")
+                
+                save_path = audit_dir / f"audit_{Path(img_p).name}"
+                img.save(save_path)
+        except Exception as e:
+            print(f"  [审计错误] {img_p}: {e}")
+
+
 # ======================== 统计报告 ========================
 def generate_text_report(
     results_by_dir: dict,
@@ -555,6 +672,21 @@ def generate_text_report(
         lines.append(f"│  小目标数    : {small_count}  ({ratio:.2f}%)")
         if delete_mode:
             lines.append(f"│  已修改文件  : {modified}")
+        
+        # 类别分布表
+        if result.get("class_stats"):
+            lines.append("│")
+            lines.append("│  [类别分类统计]")
+            lines.append("│  {:<6} | {:<10} | {:<10} | {:<8}".format("ID", "总数", "亚健康数", "健康率"))
+            lines.append("│  " + "-" * 42)
+            c_names = config.get("class_names", {})
+            for cid in sorted(result["class_stats"].keys()):
+                cur_c_total = result["class_stats"][cid]
+                cur_c_damaged = result["class_damaged"].get(cid, 0)
+                health = (1 - (cur_c_damaged / cur_c_total)) * 100 if cur_c_total > 0 else 100
+                name_str = f"({c_names.get(cid, '')})" if cid in c_names else ""
+                lines.append("│  {:<6} | {:<10} | {:<10} | {:.1f}% {}".format(cid, cur_c_total, cur_c_damaged, health, name_str))
+        
         lines.append(f"└{'─' * 40}")
 
         grand_scanned += scanned
@@ -714,6 +846,11 @@ def main():
                 continue
 
             logger.info(f"\n  正在扫描: {sub} ...")
+            
+            # 自动寻找类别名称
+            if "class_names" not in config:
+                config["class_names"] = load_classes(label_path)
+            
             result = analyze_labels(label_path, delete_mode, train_res, config, logger)
 
             ratio = (result["small"] / result["total"] * 100) if result["total"] > 0 else 0.0
@@ -778,8 +915,11 @@ def main():
     # CSV 清洗明细
     if global_all_deleted:
         generate_csv_report(global_all_deleted, output_dir)
+        # 生成审计抽样图
+        audit_n = config.get("audit_n", 20)
+        visualize_audit_samples(global_all_deleted, output_dir, n=audit_n)
     else:
-        logger.info("  [提示] 无小目标记录，跳过 CSV 明细生成。")
+        logger.info("  [提示] 无小目标记录，跳过 CSV 明细生成与审计图。")
 
     logger.info(f"\n全部完成！报告目录: {output_dir}")
 
