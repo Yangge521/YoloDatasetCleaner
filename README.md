@@ -80,6 +80,3 @@ audit_n: 20                  # 每次清洗随机生成的复核图数量
 2. `cleaning_report.txt`: 包含全局及分类统计的纯文本报告。
 3. `target_distribution.png`: 目标尺寸分布可视化图表。
 4. `deleted_targets.csv`: 所有被剔除目标的详细坐标与原因清单。
-
----
-*Powered by Antigravity AI Engineering Tools*
